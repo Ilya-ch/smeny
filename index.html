@@ -839,7 +839,7 @@ function applyAnim(){
   if(A.title){const t=$('.title h1');if(t)t.classList.add('t-in')}
 }
 const SYNCKEY='smeny.sync',LOCKKEY='smeny.lock';
-let sync=Object.assign({token:'',gist:'',key:'',salt:'',auto:true,last:0,msg:'',err:false},lsGet(SYNCKEY)||{});
+let sync=Object.assign({token:'',gist:'',store:'',key:'',salt:'',auto:true,last:0,msg:'',err:false},lsGet(SYNCKEY)||{});
 const saveSync=()=>lsSet(SYNCKEY,sync);
 
 const $=s=>document.querySelector(s);
@@ -1160,11 +1160,12 @@ function gistBlock(){
     h+=`<p class="muted small">Данные шифруются на устройстве вашей фразой-ключом и хранятся в приватном хранилище на GitHub. Без фразы их не прочтёт никто, включая GitHub.</p>
     <label class="f"><span>Токен GitHub</span><input id="syTok" type="password" autocomplete="off" placeholder="github_pat_… или ghp_…" value="${esc(sync.token)}"></label>
     <p class="note">github.com → Settings → Developer settings → Fine-grained tokens → Generate. В Account permissions дайте только «Gists: Read and write».</p>
+    <label class="f"><span>Хранилище — если вам выдали отдельное</span><input id="syStore" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Пусто — своё хранилище. Или: Ilya-ch/smeny-stas" value="${esc(sync.store||'')}"></label>
     <label class="f"><span>Фраза-ключ</span><input id="syPass" type="password" autocomplete="new-password" placeholder="Не короче 8 символов"></label>
     <p class="note">Придумайте фразу на первом устройстве и введите ту же на втором. Восстановить её нельзя: запишите в надёжное место.</p>
     <div class="btns"><button class="btn pri" data-act="syConnect">Подключить</button></div>`;
   }else{
-    h+=`<p class="muted small">Данные зашифрованы фразой-ключом и синхронизируются между вашими устройствами при каждом изменении и при открытии приложения.</p>
+    h+=`<p class="muted small">Данные зашифрованы фразой-ключом и синхронизируются между вашими устройствами при каждом изменении и при открытии приложения.</p><p class="small" style="margin:0 0 8px">Хранилище: <b>${sync.store?esc(sync.store):'личный Gist'}</b></p>
     <label class="chk"><input type="checkbox" data-syncb="auto" ${sync.auto?'checked':''}>Синхронизировать автоматически</label>
     <div class="btns"><button class="btn sm pri" data-act="syncNow">Синхронизировать сейчас</button><button class="btn sm danger" data-act="syOff">Отключить на этом устройстве</button></div>`;
   }
@@ -1499,7 +1500,7 @@ async function gh(path,opt={},token=sync.token){
   let r;
   try{r=await fetch('https://api.github.com'+path,{...opt,cache:'no-store',headers:{'Authorization':'Bearer '+token.trim(),'Accept':'application/vnd.github+json',...(opt.body?{'Content-Type':'application/json'}:{})}})}
   catch(e){throw new Error('Нет связи с GitHub')}
-  if(!r.ok){throw new Error({401:'Токен не подходит или истёк',403:'У токена нет доступа к Gists',404:'Хранилище не найдено'}[r.status]||('Ошибка GitHub '+r.status))}
+  if(!r.ok){throw new Error({401:'Токен не подходит или истёк',403:sync.store||path.startsWith('/repos')?'У токена нет права записи в этот репозиторий':'У токена нет доступа к Gists',404:'Хранилище не найдено'}[r.status]||('Ошибка GitHub '+r.status))}
   return r.status===204?null:r.json();
 }
 async function findGist(token){
@@ -1516,47 +1517,78 @@ async function fileText(g){
   if(!f.truncated)return f.content;
   const r=await fetch(f.raw_url,{cache:'no-store'});return r.text();
 }
+/* storage backends: private gist (whole account) or one repository file */
+const STORE_RE=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const b64txt=s=>btoa(unescape(encodeURIComponent(s)));
+const txtb64=s=>decodeURIComponent(escape(atob(String(s).replace(/\s/g,''))));
+async function remoteRead(tok=sync.token,store=sync.store){
+  if(store){
+    try{await gh('/repos/'+store,{},tok)}catch(e){throw new Error(/401/.test(e.message)||e.message.includes('Токен')?e.message:'Репозиторий '+store+' не найден или токен не даёт к нему доступа')}
+    let r=null;
+    try{r=await gh('/repos/'+store+'/contents/'+GFILE+'?t='+Date.now(),{},tok)}catch(e){if(!/не найдено/.test(e.message))throw e}
+    return r?{text:txtb64(r.content),sha:r.sha}:{text:null,sha:null};
+  }
+  let id=sync.gist&&tok===sync.token?sync.gist:'';
+  if(!id)id=await findGist(tok)||'';
+  if(!id)return {text:null,gist:''};
+  const g=await gh('/gists/'+encodeURIComponent(id),{},tok);
+  return {text:await fileText(g),gist:id,legacy:!!(g.files&&g.files['smeny.json'])};
+}
+async function remoteWrite(meta,content){
+  if(sync.store){
+    const body={message:'Смены: синхронизация '+new Date().toISOString(),content:b64txt(content)};if(meta.sha)body.sha=meta.sha;
+    const r=await gh('/repos/'+sync.store+'/contents/'+GFILE,{method:'PUT',body:JSON.stringify(body)});
+    return {sha:r&&r.content&&r.content.sha};
+  }
+  if(!meta.gist){
+    const g=await gh('/gists',{method:'POST',body:JSON.stringify({description:GDESC,public:false,files:{[GFILE]:{content}}})});
+    sync.gist=g.id;saveSync();return {};
+  }
+  const files={[GFILE]:{content}};if(meta.legacy)files['smeny.json']=null;
+  await gh('/gists/'+encodeURIComponent(meta.gist),{method:'PATCH',body:JSON.stringify({files})});
+  return {};
+}
 async function syConnect(){
-  const tok=($('#syTok')||{}).value?.trim()||'',pass=($('#syPass')||{}).value||'';
+  const tok=($('#syTok')||{}).value?.trim()||'',pass=($('#syPass')||{}).value||'',store=(($('#syStore')||{}).value||'').trim().replace(/^https?:\/\/github\.com\//,'').replace(/\/$/,'');
   if(!tok){setSyncMsg('Вставьте токен GitHub',true);return}
   if(pass.length<8){setSyncMsg('Фраза-ключ должна быть не короче 8 символов',true);return}
+  if(store&&!STORE_RE.test(store)){setSyncMsg('Хранилище пишется как владелец/репозиторий, например Ilya-ch/smeny-stas',true);return}
   try{
     setSyncMsg('Ищу хранилище…');
-    const id=await findGist(tok);
-    if(id){
-      const g=await gh('/gists/'+id,{},tok),text=await fileText(g),f=JSON.parse(text);
+    const meta=await remoteRead(tok,store);
+    if(meta.text){
+      const f=JSON.parse(meta.text);
       setSyncMsg('Проверяю фразу-ключ…');
       const key=await deriveKey(pass,b64d(f.salt));
-      let remote;try{remote=await openState(text,key)}catch(e){setSyncMsg('Фраза-ключ не подходит к найденному хранилищу',true);return}
-      sync.token=tok;sync.gist=id;sync.salt=f.salt;sync.key=b64e(await crypto.subtle.exportKey('raw',key));saveSync();
+      let remote;try{remote=await openState(meta.text,key)}catch(e){setSyncMsg('Фраза-ключ не подходит к найденному хранилищу',true);return}
+      sync.token=tok;sync.store=store;sync.gist=meta.gist||'';sync.salt=f.salt;sync.key=b64e(await crypto.subtle.exportKey('raw',key));saveSync();
       snap();S=merge(S,remote);persist();render();
       await syncNow(false);toast('Синхронизация включена, данные загружены');
     }else{
       setSyncMsg('Создаю зашифрованное хранилище…');
       const salt=crypto.getRandomValues(new Uint8Array(16)),key=await deriveKey(pass,salt);
-      sync.token=tok;sync.salt=b64e(salt);sync.key=b64e(await crypto.subtle.exportKey('raw',key));
-      const g=await gh('/gists',{method:'POST',body:JSON.stringify({description:GDESC,public:false,files:{[GFILE]:{content:await sealState(S)}}})});
-      sync.gist=g.id;sync.last=now();saveSync();setSyncMsg('Хранилище создано. На втором устройстве введите тот же токен и ту же фразу.');render();
+      sync.token=tok;sync.store=store;sync.gist='';sync.salt=b64e(salt);sync.key=b64e(await crypto.subtle.exportKey('raw',key));
+      await remoteWrite(meta,await sealState(S));
+      sync.last=now();saveSync();setSyncMsg('Хранилище создано. На втором устройстве введите тот же токен'+(store?', то же хранилище':'')+' и ту же фразу.');render();
       toast('Синхронизация включена');
     }
   }catch(e){setSyncMsg(e.message||'Не удалось подключиться',true)}
 }
-async function syncNow(silent){
-  if(INFRAME||!sync.token||!sync.key||syncing)return;
+async function syncNow(silent,retry){
+  if(INFRAME||!sync.token||!sync.key||(syncing&&!retry))return;
   if(navigator.onLine===false){setSyncMsg('Нет сети. Изменения сохранены на устройстве и уйдут позже',false);return}
   syncing=true;if(!silent)setSyncMsg('Синхронизация…');
   try{
-    if(!sync.gist){sync.gist=await findGist(sync.token)||'';saveSync();if(!sync.gist)throw new Error('Хранилище не найдено. Отключите синхронизацию и подключите заново')}
-    const g=await gh('/gists/'+encodeURIComponent(sync.gist)),text=await fileText(g);
+    const meta=await remoteRead();
+    if(!sync.store&&meta.gist&&meta.gist!==sync.gist){sync.gist=meta.gist;saveSync()}
     let remote=null;
-    if(text){const f=JSON.parse(text);if(f.salt!==sync.salt)throw new Error('Хранилище зашифровано другой фразой. Отключите синхронизацию и подключите заново');remote=await openState(text)}
+    if(meta.text){const f=JSON.parse(meta.text);if(f.salt!==sync.salt)throw new Error('Хранилище зашифровано другой фразой. Отключите синхронизацию и подключите заново');remote=await openState(meta.text)}
     const before=JSON.stringify(S);
     if(remote&&remote.v)S=merge(S,remote);
     const merged=JSON.stringify(S);
     if(!remote||merged!==JSON.stringify(remote)){
-      const files={[GFILE]:{content:await sealState(S)}};
-      if(g.files&&g.files['smeny.json'])files['smeny.json']=null;
-      await gh('/gists/'+encodeURIComponent(sync.gist),{method:'PATCH',body:JSON.stringify({files})});
+      try{await remoteWrite(meta,await sealState(S))}
+      catch(e){if(sync.store&&!retry&&/409|422/.test(e.message)){syncing=false;return syncNow(silent,true)}throw e}
     }
     sync.last=now();setSyncMsg('Синхронизировано: '+new Date(sync.last).toLocaleString('ru-RU'));
     if(merged!==before){lsSet(KEY,S);reindex();render();if(!sheetBusy())refreshSheet()}
@@ -1773,7 +1805,7 @@ document.addEventListener('click',ev=>{
     case 'resetAll':askConfirm('Удалить все данные?','Смены, календари, компании и настройки удалятся на всех устройствах. Сначала лучше сохранить копию.','Удалить всё',()=>{snap();const t=now();for(const c of COLLS)for(const k in S[c])S[c][k]={id:k,del:true,u:t};const d=defaults();for(const k in d.types)put('types',d.types[k]);put('calendars',d.calendars.c1);S.settings={...d.settings,u:t};ui.cal='c1';persist();render();toast('Данные удалены')});break;
     case 'syConnect':syConnect();break;
     case 'syncNow':syncNow(false);break;
-    case 'syOff':askConfirm('Отключить синхронизацию?','На этом устройстве удалятся токен и ключ. Данные останутся здесь и в облаке; включить можно снова той же фразой.','Отключить',()=>{sync={token:'',gist:'',key:'',salt:'',auto:true,last:0,msg:'',err:false};saveSync();render()});break;
+    case 'syOff':askConfirm('Отключить синхронизацию?','На этом устройстве удалятся токен и ключ. Данные останутся здесь и в облаке; включить можно снова той же фразой.','Отключить',()=>{sync={token:'',gist:'',store:'',key:'',salt:'',auto:true,last:0,msg:'',err:false};saveSync();render()});break;
     case 'pinSet':lockState.mode='set1';lockState.buf='';lockState.first='';renderLock();break;
     case 'pinCancel':$('#lock').hidden=true;break;
     case 'pinOff':askConfirm('Выключить код?','Приложение будет открываться без кода на этом устройстве.','Выключить',()=>{try{localStorage.removeItem(LOCKKEY)}catch(e){}render()});break;
